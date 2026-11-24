@@ -1,0 +1,11 @@
+# 构建产物
+dist/
+build/
+*.spec
+
+# Python
+__pycache__/
+*.pyc
+
+# 运行时标记
+screendimmer_active
