@@ -34,6 +34,7 @@ rem ---------- collect runtime deps (conda layout: libffi / tcl / tk) ----------
 set "ARGS=--onefile --noconsole --clean --name ScreenDimmer"
 
 if exist "%PREFIX%\Library\bin\ffi.dll"    set ARGS=!ARGS! --add-binary "%PREFIX%\Library\bin\ffi.dll;."
+if exist "%~dp0icon.ico"                   set ARGS=!ARGS! --icon "%~dp0icon.ico"
 if exist "%PREFIX%\Library\bin\tcl86t.dll" set ARGS=!ARGS! --add-binary "%PREFIX%\Library\bin\tcl86t.dll;."
 if exist "%PREFIX%\Library\bin\tk86t.dll"  set ARGS=!ARGS! --add-binary "%PREFIX%\Library\bin\tk86t.dll;."
 if exist "%PREFIX%\Library\lib\tcl8.6"     set ARGS=!ARGS! --add-data "%PREFIX%\Library\lib\tcl8.6;tcl\tcl8.6"

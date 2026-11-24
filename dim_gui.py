@@ -12,6 +12,7 @@ dim_gui.py — 亮度调节小窗体（可低于显示器硬件最低亮度）
 - 异常退出（强杀/崩溃）后下次启动自动恢复亮度
 """
 import atexit
+import base64
 import ctypes
 import os
 import queue
@@ -150,34 +151,77 @@ user32.DefWindowProcW.argtypes = [
     wintypes.HWND, wintypes.UINT, ctypes.c_size_t, c_ssize_t]
 
 
-def _build_tray_hicon():
-    """程序绘制一个 32x32 32bpp 托盘图标（调光滑块风格：蓝环+暗芯），无需外部 .ico 文件。"""
-    g32 = WinDLL("gdi32", use_last_error=True)
-    size = 32
-    px = bytearray()
+# ---------------- 图标绘制（托盘 / 窗口标题栏 / exe 共用同一设计）----------------
+ICON_DARK = (0x1e, 0x24, 0x30)    # 内芯：暗色（表示调暗）
+ICON_ACCENT = (0x4a, 0x9e, 0xff)  # 外环：亮蓝
+
+
+def _icon_pixel(u, v, size):
+    """连续坐标 (u,v) 处的颜色；圆环设计：蓝环 + 暗芯，None 表示透明"""
+    unit = size / 32.0
+    r = ((u - size / 2.0) ** 2 + (v - size / 2.0) ** 2) ** 0.5
+    r_out = 14 * unit
+    if r > r_out + 0.5:
+        return None
+    if r <= 7 * unit:
+        c = ICON_DARK
+    else:
+        t = min(1.0, (r - 7 * unit) / (5 * unit))
+        c = tuple(int(a + (b - a) * t) for a, b in zip(ICON_DARK, ICON_ACCENT))
+    # 外缘抗锯齿
+    a = 255 if r <= r_out - 0.7 else int(255 * (r_out + 0.7 - r) / 1.4)
+    return (*c, max(0, min(255, a)))
+
+
+def _icon_rgba(size, ss=3):
+    """生成 size x size 的 RGBA 字节串（自顶向下），ss=每像素超采样次数（抗锯齿）"""
+    buf = bytearray(size * size * 4)
     for y in range(size):
         for x in range(size):
-            dx, dy = x - 15.5, y - 15.5
-            r = (dx * dx + dy * dy) ** 0.5
-            if r <= 14:
-                if r <= 7:      # 内芯：暗色（表示调暗）
-                    px += bytes((0x30, 0x24, 0x1e, 0xff))   # BGRA
-                elif r >= 12:   # 外环：亮蓝
-                    px += bytes((0xff, 0x9e, 0x4a, 0xff))
-                else:           # 过渡环
-                    t = (r - 7) / 5
-                    px += bytes((int(0x30 + (0xff - 0x30) * t),
-                                 int(0x24 + (0x9e - 0x24) * t),
-                                 int(0x1e + (0x4a - 0x1e) * t), 0xff))
-            else:
-                px += bytes((0, 0, 0, 0))
-    # BGRA 自底向上
+            rs = gs = bs = asum = cnt = 0
+            for sy in range(ss):
+                for sx in range(ss):
+                    p = _icon_pixel(x + (sx + 0.5) / ss, y + (sy + 0.5) / ss,
+                                    size)
+                    if p:
+                        rs += p[0]; gs += p[1]; bs += p[2]
+                        asum += p[3]; cnt += 1
+            o = (y * size + x) * 4
+            if cnt:
+                buf[o:o + 4] = bytes((rs // cnt, gs // cnt, bs // cnt,
+                                      asum // ss ** 2))
+    return bytes(buf)
+
+
+def _png_bytes(rgba, size):
+    """RGBA 数据编码为 PNG（喂给 tk.PhotoImage 设置标题栏图标）"""
+    import zlib
+    import struct
+    raw = b"".join(b"\x00" + rgba[y * size * 4:(y + 1) * size * 4]
+                   for y in range(size))
+
+    def chunk(tag, d):
+        return (struct.pack(">I", len(d)) + tag + d +
+                struct.pack(">I", zlib.crc32(tag + d)))
+    ihdr = struct.pack(">IIBBBBB", size, size, 8, 6, 0, 0, 0)
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr) +
+            chunk(b"IDAT", zlib.compress(raw, 9)) + chunk(b"IEND", b""))
+
+
+def _build_tray_hicon():
+    """用共享设计生成 32x32 托盘 HICON（BGRA 自底向上），无需外部 .ico 文件"""
+    size = 32
+    rgba = _icon_rgba(size)
     stride = size * 4
-    rows = [bytes(px[y * stride:(y + 1) * stride]) for y in range(size)]
-    xor = b"".join(reversed(rows))
+    rows = []
+    for y in range(size - 1, -1, -1):
+        row = rgba[y * stride:(y + 1) * stride]
+        rows.append(bytes(x for i in range(0, stride, 4)
+                          for x in (row[i + 2], row[i + 1], row[i],
+                                    row[i + 3])))
+    xor = b"".join(rows)
     and_mask = bytes(size // 8 * size)  # 全 0，alpha 生效
-    hicon = user32.CreateIcon(None, size, size, 1, 32, and_mask, xor)
-    return hicon
+    return user32.CreateIcon(None, size, size, 1, 32, and_mask, xor)
 
 
 class Tray:
@@ -288,6 +332,187 @@ class Tray:
             user32.PostMessageW(self.hwnd, WM_APP_TRAY_EXIT, 0, 0)
 
 
+# ---------------- 鼠标指针压暗 ----------------
+# 硬件光标不经过 gamma 也不被遮罩盖住，调暗屏幕时鼠标会保持高亮。
+# 做法：把系统标准光标集替换为按亮度系数压暗的副本；恢复用 SPI_SETCURSORS。
+SPI_SETCURSORS = 0x0057
+CURSOR_IDS = (32512, 32513, 32514, 32515, 32516, 32642, 32643, 32644,
+              32645, 32646, 32648, 32649, 32650)  # 箭头/文本/忙碌/十字/调整大小等
+IMAGE_BITMAP = 0
+DIB_RGB_COLORS = 0
+
+
+class ICONINFO(Structure):
+    _fields_ = [("fIcon", wintypes.BOOL), ("xHotspot", wintypes.DWORD),
+                ("yHotspot", wintypes.DWORD), ("hbmMask", wintypes.HBITMAP),
+                ("hbmColor", wintypes.HBITMAP)]
+
+
+class _BITMAP(Structure):
+    _fields_ = [("bmType", wintypes.LONG), ("bmWidth", wintypes.LONG),
+                ("bmHeight", wintypes.LONG), ("bmWidthBytes", wintypes.LONG),
+                ("bmPlanes", wintypes.WORD), ("bmBitsPixel", wintypes.WORD),
+                ("bmBits", ctypes.c_void_p)]
+
+
+class _BMIH(Structure):
+    _fields_ = [("biSize", wintypes.DWORD), ("biWidth", wintypes.LONG),
+                ("biHeight", wintypes.LONG), ("biPlanes", wintypes.WORD),
+                ("biBitCount", wintypes.WORD), ("biCompression", wintypes.DWORD),
+                ("biSizeImage", wintypes.DWORD), ("biXPelsPerMeter", wintypes.LONG),
+                ("biYPelsPerMeter", wintypes.LONG), ("biClrUsed", wintypes.DWORD),
+                ("biClrImportant", wintypes.DWORD)]
+
+
+class _BMI(Structure):
+    _fields_ = [("bmiHeader", _BMIH), ("bmiColors", wintypes.DWORD * 3)]
+
+
+gdi32 = WinDLL("gdi32", use_last_error=True)
+user32.GetIconInfo.argtypes = [wintypes.HANDLE, POINTER(ICONINFO)]
+user32.LoadCursorW.restype = wintypes.HANDLE
+user32.LoadCursorW.argtypes = [wintypes.HINSTANCE, ctypes.c_void_p]
+user32.CopyIcon.restype = wintypes.HANDLE
+user32.CopyIcon.argtypes = [wintypes.HANDLE]
+user32.CopyImage.restype = wintypes.HANDLE
+user32.CopyImage.argtypes = [wintypes.HANDLE, wintypes.UINT, ctypes.c_int,
+                             ctypes.c_int, wintypes.UINT]
+user32.SetSystemCursor.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+user32.CreateIconIndirect.restype = wintypes.HANDLE
+user32.CreateIconIndirect.argtypes = [POINTER(ICONINFO)]
+gdi32.GetObjectW.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p]
+gdi32.GetDIBits.argtypes = [wintypes.HANDLE, wintypes.HANDLE, wintypes.UINT,
+                            wintypes.UINT, ctypes.c_void_p,
+                            ctypes.c_void_p, wintypes.UINT]
+gdi32.CreateDIBSection.restype = wintypes.HANDLE
+gdi32.CreateDIBSection.argtypes = [wintypes.HANDLE, ctypes.c_void_p,
+                                   wintypes.UINT, POINTER(ctypes.c_void_p),
+                                   wintypes.HANDLE, wintypes.DWORD]
+gdi32.CreateCompatibleDC.restype = wintypes.HANDLE
+gdi32.CreateCompatibleDC.argtypes = [wintypes.HDC]
+gdi32.DeleteObject.argtypes = [wintypes.HANDLE]
+gdi32.DeleteDC.argtypes = [wintypes.HDC]
+
+_cursor_base = {}   # OCR id -> 原始光标副本（首次压暗前抓取，保证重复调暗不叠加）
+_got_base = False
+
+
+def _read_cursor_bgra(hcursor):
+    """读取光标的 32bpp BGRA 像素与热区/尺寸；失败返回 None"""
+    ii = ICONINFO()
+    if not user32.GetIconInfo(hcursor, byref(ii)):
+        return None
+    bm = _BITMAP()
+    if not gdi32.GetObjectW(ii.hbmColor, ctypes.sizeof(bm), byref(bm)):
+        gdi32.DeleteObject(ii.hbmMask); gdi32.DeleteObject(ii.hbmColor)
+        return None
+    w, h = bm.bmWidth, bm.bmHeight
+    hdc = gdi32.CreateCompatibleDC(None)
+    bmi = _BMI()
+    bmi.bmiHeader.biSize = ctypes.sizeof(_BMIH)
+    bmi.bmiHeader.biWidth = w
+    bmi.bmiHeader.biHeight = -h          # 自顶向下
+    bmi.bmiHeader.biPlanes = 1
+    bmi.bmiHeader.biBitCount = 32
+    bmi.bmiHeader.biCompression = 0      # BI_RGB
+    buf = (ctypes.c_ubyte * (w * h * 4))()
+    ok = gdi32.GetDIBits(hdc, ii.hbmColor, 0, h, buf, byref(bmi),
+                         DIB_RGB_COLORS)
+    gdi32.DeleteDC(hdc)
+    if not ok:
+        gdi32.DeleteObject(ii.hbmMask); gdi32.DeleteObject(ii.hbmColor)
+        return None
+    data = bytes(buf)
+    result = (data, w, h, ii.xHotspot, ii.yHotspot,
+              ii.hbmMask, ii.hbmColor)
+    return result
+
+
+def _make_dimmed_cursor(base_hcursor, factor):
+    """从基准光标生成亮度 factor(0-1) 的压暗副本 HCURSOR；需调用方负责 SetSystemCursor"""
+    got = _read_cursor_bgra(base_hcursor)
+    if got is None:
+        return None
+    data, w, h, xh, yh, mask_orig, color_orig = got
+    n = w * h
+    out = bytearray(data)
+    # 无 alpha 通道的老式光标：视为不透明（形状由 AND 掩码决定）
+    has_alpha = any(out[i + 3] for i in range(0, n * 4, 4))
+    for i in range(n):
+        o = i * 4
+        out[o] = int(out[o] * factor)        # B
+        out[o + 1] = int(out[o + 1] * factor)  # G
+        out[o + 2] = int(out[o + 2] * factor)  # R
+        if not has_alpha:
+            out[o + 3] = 0xFF
+    # 生成新的 32bpp color 位图（自顶向下 DIB Section）
+    bmi = _BMI()
+    bmi.bmiHeader.biSize = ctypes.sizeof(_BMIH)
+    bmi.bmiHeader.biWidth = w
+    bmi.bmiHeader.biHeight = -h
+    bmi.bmiHeader.biPlanes = 1
+    bmi.bmiHeader.biBitCount = 32
+    bmi.bmiHeader.biCompression = 0
+    hdc = gdi32.CreateCompatibleDC(None)
+    bits = ctypes.c_void_p()
+    hbm = gdi32.CreateDIBSection(hdc, byref(bmi), DIB_RGB_COLORS,
+                                 byref(bits), None, 0)
+    gdi32.DeleteDC(hdc)
+    if not hbm or not bits:
+        if hbm: gdi32.DeleteObject(hbm)
+        gdi32.DeleteObject(mask_orig); gdi32.DeleteObject(color_orig)
+        return None
+    ctypes.memmove(bits, bytes(out), n * 4)
+    mask_copy = user32.CopyImage(mask_orig, IMAGE_BITMAP, 0, 0, 0)
+    ci = ICONINFO(fIcon=0, xHotspot=xh, yHotspot=yh,
+                  hbmMask=mask_copy, hbmColor=hbm)
+    hcur = user32.CreateIconIndirect(byref(ci))
+    gdi32.DeleteObject(hbm)
+    if mask_copy: gdi32.DeleteObject(mask_copy)
+    gdi32.DeleteObject(mask_orig)
+    gdi32.DeleteObject(color_orig)
+    return hcur
+
+
+def _capture_base_cursors():
+    global _got_base
+    if _got_base:
+        return
+    for cid in CURSOR_IDS:
+        h = user32.LoadCursorW(None, cid)
+        if h:
+            _cursor_base[cid] = user32.CopyIcon(h)
+    _got_base = True
+
+
+def cursor_apply(percent):
+    """把系统标准光标压暗到 percent%（与滑条亮度完全同步，无下限）"""
+    pct = max(1, min(100, percent))
+    _capture_base_cursors()
+    factor = pct / 100.0
+    changed = 0
+    for cid, base in _cursor_base.items():
+        hcur = _make_dimmed_cursor(base, factor)
+        if hcur:
+            if user32.SetSystemCursor(hcur, cid):
+                changed += 1
+    return changed
+
+
+def cursor_restore():
+    """会话内恢复：用开局抓取的基准副本 1:1 重放（保留用户真实光标外观）"""
+    _capture_base_cursors()
+    for cid, base in _cursor_base.items():
+        hcur = _make_dimmed_cursor(base, 1.0)
+        if hcur:
+            user32.SetSystemCursor(hcur, cid)
+
+
+def cursor_restore_system():
+    """从注册表重载系统光标方案（崩溃恢复 / 命令行兜底用）"""
+    user32.SystemParametersInfoW(SPI_SETCURSORS, 0, None, 0)
+
+
 # ---------------- 异常退出标记 ----------------
 MARKER = os.path.join(
     os.environ.get("TEMP", os.path.expanduser("~")), "screendimmer_active")
@@ -396,6 +621,13 @@ class App:
         self.root.title("屏幕亮度")
         self.root.resizable(False, False)   # 不置顶，普通窗口
         self.root.config(bg=BG)
+        # 标题栏图标与托盘/exe 一致（同一绘制代码生成 PNG）
+        try:
+            self._icon_img = tk.PhotoImage(
+                data=base64.b64encode(_png_bytes(_icon_rgba(64, ss=3), 64)))
+            self.root.iconphoto(True, self._icon_img)
+        except Exception:
+            pass
         self.root.protocol("WM_DELETE_WINDOW", self._real_exit)  # 点X=真正退出
         self.root.bind("<Unmap>", self._on_unmap)
         self.root.bind("<Escape>", lambda e: self.reset(flash=True))
@@ -447,14 +679,18 @@ class App:
         self._crash_recovered = os.path.exists(MARKER)
         if self._crash_recovered:
             gamma_restore()
+            cursor_restore_system()  # 强杀后系统光标可能停在压暗状态，从注册表重载
             _clear_marker()
             self._flash("✓ 已恢复上次异常退出的亮度")
+        # 开局抓基准光标副本（后续会话内恢复靠它 1:1 重放）
+        _capture_base_cursors()
 
         # 平滑动画状态
         self.current = 100.0
         self.target = 100.0
         self._dirty = False
         self._flash_token = 0
+        self._cursor_pct = None
         self._tray_hint_shown = False
         self._restored = False
         atexit.register(self.restore_once)
@@ -484,6 +720,13 @@ class App:
             if not ok:
                 self.label.config(text=f"{p}% (gamma异常)", fg="#ff6b6b")
                 return False
+        # 鼠标指针跟随屏幕亮度同步压暗/恢复
+        if self._cursor_pct != p:
+            self._cursor_pct = p
+            if p >= 100:
+                cursor_restore()
+            else:
+                cursor_apply(p)
         return True
 
     def _tick(self):
@@ -555,6 +798,10 @@ class App:
                 gamma_restore()
             except Exception:
                 pass
+            try:
+                cursor_restore()
+            except Exception:
+                pass
 
     def _poll_tray(self):
         try:
@@ -599,6 +846,7 @@ class App:
 if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] in ("restore", "--restore"):
         gamma_restore()
+        cursor_restore_system()
         _clear_marker()
         print("已恢复亮度")
     else:
