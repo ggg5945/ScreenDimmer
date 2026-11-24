@@ -2,6 +2,14 @@ name: Build Windows EXE
 
 on:
   workflow_dispatch:   # 仅手动触发：Actions 页面 → Run workflow
+    inputs:
+      version:
+        description: '版本号 (如 v1.0.0)'
+        required: true
+        default: 'v1.0.0'
+
+permissions:
+  contents: write      # 允许创建 Release / Tag
 
 jobs:
   build:
@@ -34,4 +42,23 @@ jobs:
           name: ScreenDimmer
           path: dist/ScreenDimmer.exe
           if-no-files-found: error
-          retention-days: 300
+          retention-days: 90
+
+      - name: Create Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >
+          gh release create ${{ inputs.version }} dist/ScreenDimmer.exe
+          --target ${{ github.sha }}
+          --title "ScreenDimmer ${{ inputs.version }}"
+          --notes "ScreenDimmer ${{ inputs.version }} 自动构建。
+
+          下载 ScreenDimmer.exe 双击即用（单文件，无需安装）。
+
+          - 滑条/点击调暗 1%-100%，右侧 Ctrl+R 恢复
+
+          - 最小化到托盘，点 X 退出并恢复亮度
+
+          - 鼠标指针同步调暗
+
+          - 异常退出后重新打开程序自动恢复亮度"
