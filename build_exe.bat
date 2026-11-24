@@ -10,7 +10,7 @@ rem ---------- check python ----------
 where python >nul 2>nul
 if errorlevel 1 (
     echo [ERROR] python not found in PATH
-    pause
+    if not defined CI pause
     exit /b 1
 )
 
@@ -21,7 +21,7 @@ if errorlevel 1 (
     python -m pip install pyinstaller
     if errorlevel 1 (
         echo [ERROR] failed to install PyInstaller
-        pause
+        if not defined CI pause
         exit /b 1
     )
 )
@@ -49,7 +49,7 @@ if exist "dist\ScreenDimmer.exe" (
     del "dist\ScreenDimmer.exe" >nul 2>nul
     if exist "dist\ScreenDimmer.exe" (
         echo [ERROR] dist\ScreenDimmer.exe is locked. Close the running ScreenDimmer first.
-        pause
+        if not defined CI pause
         exit /b 1
     )
 )
@@ -59,7 +59,7 @@ echo [build] building...
 python -m PyInstaller %ARGS% dim_gui.py
 if errorlevel 1 (
     echo [ERROR] build failed, see log above
-    pause
+    if not defined CI pause
     exit /b 1
 )
 
@@ -71,4 +71,4 @@ echo.
 echo ==============================================
 echo   Done: %~dp0dist\ScreenDimmer.exe
 echo ==============================================
-pause
+if not defined CI pause
