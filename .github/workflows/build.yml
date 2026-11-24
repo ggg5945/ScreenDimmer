@@ -34,4 +34,4 @@ jobs:
           name: ScreenDimmer
           path: dist/ScreenDimmer.exe
           if-no-files-found: error
-          retention-days: 30
+          retention-days: 300
