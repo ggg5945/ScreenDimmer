@@ -69,6 +69,39 @@ build_exe.bat
 > 注意：bat 内容为纯 ASCII，不要往里加中文（cmd 解析 UTF-8 中文批处理
 > 容易出现字节错位把内容当命令执行）。
 
+## 开发
+
+**环境**：Windows 10/11；Python 3.12（3.8+ 均可）；零第三方依赖——GUI 用
+标准库 `tkinter`，系统交互用 `ctypes`，无需 `pip install` 任何东西。
+
+**从源码运行**：
+
+```
+python dim_gui.py            窗体程序
+python dim.py 30             命令行调光器（30%）
+python gen_icon.py           重新生成 icon.ico（改过 _icon_pixel 后）
+build_exe.bat                打包
+```
+
+**代码要点**（改代码前值得知道的实现细节）：
+
+| 模块 | 关键点 |
+|---|---|
+| gamma 调光 | `SetDeviceGammaRamp`，驱动拒绝压暗超过 50% 的曲线，50% 以下由遮罩补足 |
+| 遮罩 | `Toplevel` 全屏黑窗 + `WS_EX_TRANSPARENT\|WS_EX_LAYERED`（点击穿透），`SetLayeredWindowAttributes` 控制透明度 |
+| 全局热键 | 独立线程装 `WH_KEYBOARD_LL` 底层键盘钩子，右 Ctrl（VK 0xA3）按下时才响应 R；事件经 `threading.Event` 交给 Tk 主线程轮询 |
+| 托盘 | 独立线程的隐藏消息窗口 + `Shell_NotifyIcon`，菜单动作经 `queue.Queue` 回到主线程 |
+| 光标压暗 | 开局 `CopyIcon` 抓基准光标副本，压暗时逐像素缩放 RGB 后 `CreateIconIndirect` + `SetSystemCursor`；恢复=基准副本 1:1 重放（不用 `SPI_SETCURSORS`，避免覆盖用户自定义光标方案） |
+| 动画 | 亮度值每 16ms 向目标插值 0.3，收敛后补一次最终应用（`_dirty` 标记） |
+| 异常自检 | 调暗中在 `%TEMP%\screendimmer_active` 留标记，正常退出删除；下次启动发现标记即恢复亮度+重载光标方案 |
+
+**ctypes 坑位清单**（本项目踩过）：64 位下给 Windows API 传句柄/参数前必须设
+`restype`/`argtypes`（否则 int 截断触发 `int too long to convert`）；
+`wintypes` 没有 `WNDCLASSW`/`INPUT`（前者需自定义，后者按 40 字节对齐
+union）；`GetMessageW` 的 MSG 缓冲必须用完整结构（48 字节），缓冲不足会写越界静默破坏消息泵。
+
+版本号只存在于 Release Tag 上（exe 内部未嵌版本信息），以 Releases 页为准。
+
 ## 文件结构
 
 ```
