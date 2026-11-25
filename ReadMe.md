@@ -91,7 +91,8 @@ build_exe.bat                打包
 | 遮罩 | `Toplevel` 全屏黑窗 + `WS_EX_TRANSPARENT\|WS_EX_LAYERED`（点击穿透），`SetLayeredWindowAttributes` 控制透明度 |
 | 全局热键 | 独立线程装 `WH_KEYBOARD_LL` 底层键盘钩子，右 Ctrl（VK 0xA3）按下时才响应 R；事件经 `threading.Event` 交给 Tk 主线程轮询 |
 | 托盘 | 独立线程的隐藏消息窗口 + `Shell_NotifyIcon`，菜单动作经 `queue.Queue` 回到主线程 |
-| 光标压暗 | 开局 `CopyIcon` 抓基准光标副本，压暗时逐像素缩放 RGB 后 `CreateIconIndirect` + `SetSystemCursor`；恢复=基准副本 1:1 重放（不用 `SPI_SETCURSORS`，避免覆盖用户自定义光标方案） |
+| 光标压暗 | 开局抓取基准光标：优先用注册表鼠标方案里的 `.cur` 文件（`LoadImageW`），读不出形状才回退 `LoadCursorW`；压暗时缩放 RGB 后 `CreateIconIndirect` + `SetSystemCursor`；恢复用 `SPI_SETCURSORS` 从注册表重载方案（用户自定义方案也一并还原） |
+| 光标形状来源 | 按 alpha → AND 掩码 → 单色 AND/XOR 三级取值；1bpp 掩码必须靠 `BitBlt` 读（`GetDIBits` 会返回全 1 假数据），形状读不出来就跳过这只光标，绝不硬造（详见下面坑位清单） |
 | 动画 | 亮度值每 16ms 向目标插值 0.3，收敛后补一次最终应用（`_dirty` 标记） |
 | 异常自检 | 调暗中在 `%TEMP%\screendimmer_active` 留标记，正常退出删除；下次启动发现标记即恢复亮度+重载光标方案 |
 
@@ -99,6 +100,12 @@ build_exe.bat                打包
 `restype`/`argtypes`（否则 int 截断触发 `int too long to convert`）；
 `wintypes` 没有 `WNDCLASSW`/`INPUT`（前者需自定义，后者按 40 字节对齐
 union）；`GetMessageW` 的 MSG 缓冲必须用完整结构（48 字节），缓冲不足会写越界静默破坏消息泵。
+
+**光标坑位（差点毁掉文本光标）**：
+- `IDC_IBEAM`(32513) 是单色+XOR 光标，`LoadCursorW` 返回的是被 GDI 转换过的版本：
+  alpha 全 255、AND 掩码全 1，形状信息全丢。照着重画 = 输入框里光标周围一个不透明黑方块。
+- `GetDIBits` 读 1bpp 掩码不可靠（返回全 1 假数据），必须 `BitBlt` 到 32bpp DIB 再读。
+- 恢复千万别用「factor=1.0 重建」回放，直接 `SPI_SETCURSORS` 从注册表重载才是原样。
 
 版本号只存在于 Release Tag 上（exe 内部未嵌版本信息），以 Releases 页为准。
 

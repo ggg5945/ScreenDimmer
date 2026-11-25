@@ -9,3 +9,6 @@ __pycache__/
 
 # 运行时标记
 screendimmer_active
+
+# 临时脚本
+.tmp/

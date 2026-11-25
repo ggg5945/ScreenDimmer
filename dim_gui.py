@@ -335,10 +335,16 @@ class Tray:
 # ---------------- 鼠标指针压暗 ----------------
 # 硬件光标不经过 gamma 也不被遮罩盖住，调暗屏幕时鼠标会保持高亮。
 # 做法：把系统标准光标集替换为按亮度系数压暗的副本；恢复用 SPI_SETCURSORS。
+#
+# 坑（踩过的坑，别再改回去）：
+# 1) 32513 文本 I 形光标是「单色 + XOR」光标，LoadCursorW 拿到的是被 GDI 转换
+#    过的 32bpp 位图：alpha 全 255、AND 掩码全 1 —— 形状信息全丢。照着重画
+#    就会得到一个不透明的 32x32 黑方块（输入框里光标周围的黑块）。
+# 2) 1bpp 位图不能用 GetDIBits 读，它返回一堆全 1 的假数据，必须用 BitBlt。
+# 3) 读不出形状的光标一律跳过（保持原样），绝不硬造。
 SPI_SETCURSORS = 0x0057
 CURSOR_IDS = (32512, 32513, 32514, 32515, 32516, 32642, 32643, 32644,
               32645, 32646, 32648, 32649, 32650)  # 箭头/文本/忙碌/十字/调整大小等
-IMAGE_BITMAP = 0
 DIB_RGB_COLORS = 0
 
 
@@ -374,12 +380,15 @@ user32.LoadCursorW.restype = wintypes.HANDLE
 user32.LoadCursorW.argtypes = [wintypes.HINSTANCE, ctypes.c_void_p]
 user32.CopyIcon.restype = wintypes.HANDLE
 user32.CopyIcon.argtypes = [wintypes.HANDLE]
-user32.CopyImage.restype = wintypes.HANDLE
-user32.CopyImage.argtypes = [wintypes.HANDLE, wintypes.UINT, ctypes.c_int,
-                             ctypes.c_int, wintypes.UINT]
 user32.SetSystemCursor.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+user32.DestroyCursor.argtypes = [wintypes.HANDLE]
 user32.CreateIconIndirect.restype = wintypes.HANDLE
 user32.CreateIconIndirect.argtypes = [POINTER(ICONINFO)]
+user32.LoadImageW.restype = wintypes.HANDLE
+user32.LoadImageW.argtypes = [wintypes.HINSTANCE, wintypes.LPCWSTR,
+                              wintypes.UINT, ctypes.c_int, ctypes.c_int,
+                              wintypes.UINT]
+user32.GetSystemMetrics.argtypes = [ctypes.c_int]
 gdi32.GetObjectW.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p]
 gdi32.GetDIBits.argtypes = [wintypes.HANDLE, wintypes.HANDLE, wintypes.UINT,
                             wintypes.UINT, ctypes.c_void_p,
@@ -390,24 +399,30 @@ gdi32.CreateDIBSection.argtypes = [wintypes.HANDLE, ctypes.c_void_p,
                                    wintypes.HANDLE, wintypes.DWORD]
 gdi32.CreateCompatibleDC.restype = wintypes.HANDLE
 gdi32.CreateCompatibleDC.argtypes = [wintypes.HDC]
+gdi32.CreateBitmap.restype = wintypes.HANDLE
+gdi32.CreateBitmap.argtypes = [ctypes.c_int, ctypes.c_int, wintypes.UINT,
+                               wintypes.UINT, ctypes.c_void_p]
+gdi32.SelectObject.restype = wintypes.HANDLE
+gdi32.SelectObject.argtypes = [wintypes.HDC, wintypes.HANDLE]
+gdi32.BitBlt.argtypes = [wintypes.HDC, ctypes.c_int, ctypes.c_int,
+                         ctypes.c_int, ctypes.c_int, wintypes.HDC,
+                         ctypes.c_int, ctypes.c_int, wintypes.DWORD]
 gdi32.DeleteObject.argtypes = [wintypes.HANDLE]
 gdi32.DeleteDC.argtypes = [wintypes.HDC]
+
+SRCCOPY = 0x00CC0020
+IMAGE_CURSOR = 2
+LR_LOADFROMFILE = 0x0010
+SM_CXCURSOR, SM_CYCURSOR = 13, 14
 
 _cursor_base = {}   # OCR id -> 原始光标副本（首次压暗前抓取，保证重复调暗不叠加）
 _got_base = False
 
 
-def _read_cursor_bgra(hcursor):
-    """读取光标的 32bpp BGRA 像素与热区/尺寸；失败返回 None"""
-    ii = ICONINFO()
-    if not user32.GetIconInfo(hcursor, byref(ii)):
+def _read_dib_32(hbm, w, h):
+    """读 32bpp 位图为自顶向下的 BGRA 字节串；失败返回 None"""
+    if not hbm or w <= 0 or h <= 0:
         return None
-    bm = _BITMAP()
-    if not gdi32.GetObjectW(ii.hbmColor, ctypes.sizeof(bm), byref(bm)):
-        gdi32.DeleteObject(ii.hbmMask); gdi32.DeleteObject(ii.hbmColor)
-        return None
-    w, h = bm.bmWidth, bm.bmHeight
-    hdc = gdi32.CreateCompatibleDC(None)
     bmi = _BMI()
     bmi.bmiHeader.biSize = ctypes.sizeof(_BMIH)
     bmi.bmiHeader.biWidth = w
@@ -416,35 +431,147 @@ def _read_cursor_bgra(hcursor):
     bmi.bmiHeader.biBitCount = 32
     bmi.bmiHeader.biCompression = 0      # BI_RGB
     buf = (ctypes.c_ubyte * (w * h * 4))()
-    ok = gdi32.GetDIBits(hdc, ii.hbmColor, 0, h, buf, byref(bmi),
-                         DIB_RGB_COLORS)
+    hdc = gdi32.CreateCompatibleDC(None)
+    ok = gdi32.GetDIBits(hdc, hbm, 0, h, buf, byref(bmi), DIB_RGB_COLORS)
     gdi32.DeleteDC(hdc)
-    if not ok:
-        gdi32.DeleteObject(ii.hbmMask); gdi32.DeleteObject(ii.hbmColor)
+    return bytes(buf) if ok else None
+
+
+def _blit_32(hbm, w, h):
+    """把任意位图（含 1bpp 掩码）BitBlt 到 32bpp DIB，返回自顶向下 BGRA；失败 None
+
+    注意：1bpp 位图不能用 GetDIBits 读 —— GDI 会返回一堆全 1 的假数据，
+    只有 BitBlt 才能拿到真实位。
+    """
+    if not hbm or w <= 0 or h <= 0:
         return None
-    data = bytes(buf)
-    result = (data, w, h, ii.xHotspot, ii.yHotspot,
-              ii.hbmMask, ii.hbmColor)
-    return result
+    bmi = _BMI()
+    bmi.bmiHeader.biSize = ctypes.sizeof(_BMIH)
+    bmi.bmiHeader.biWidth = w
+    bmi.bmiHeader.biHeight = -h          # 自顶向下
+    bmi.bmiHeader.biPlanes = 1
+    bmi.bmiHeader.biBitCount = 32
+    bmi.bmiHeader.biCompression = 0
+    dst = gdi32.CreateCompatibleDC(None)
+    bits = ctypes.c_void_p()
+    hbm_dst = gdi32.CreateDIBSection(dst, byref(bmi), DIB_RGB_COLORS,
+                                     byref(bits), None, 0)
+    if not hbm_dst or not bits:
+        if hbm_dst:
+            gdi32.DeleteObject(hbm_dst)
+        gdi32.DeleteDC(dst)
+        return None
+    old_dst = gdi32.SelectObject(dst, hbm_dst)
+    src = gdi32.CreateCompatibleDC(None)
+    old_src = gdi32.SelectObject(src, hbm)
+    ok = gdi32.BitBlt(dst, 0, 0, w, h, src, 0, 0, SRCCOPY)
+    gdi32.SelectObject(src, old_src)
+    gdi32.SelectObject(dst, old_dst)
+    data = None
+    if ok:
+        data = bytes((ctypes.c_ubyte * (w * h * 4)).from_address(bits.value))
+    gdi32.DeleteObject(hbm_dst)
+    gdi32.DeleteDC(src)
+    gdi32.DeleteDC(dst)
+    return data
+
+
+def _mask_bits(px, w, h):
+    """32bpp 图转 0/1 数组：1 = 白（1bpp 掩码里的位 1 = AND 掩码的透明位）"""
+    if px is None:
+        return None
+    return bytes(1 if px[i * 4] > 127 else 0 for i in range(w * h))
+
+
+def _read_cursor(hcursor):
+    """读取光标：返回 (bgra, w, h, xhot, yhot, transparent)，读不出来返回 None
+
+    transparent 与像素同尺寸，1 表示该像素透明。三种信息来源按可靠性排序：
+    1. 32bpp 位图的真 alpha 通道（现代光标）；
+    2. AND 掩码（老式 32bpp 光标，alpha 被 GDI 填成假的全 255）；
+    3. 单色光标：掩码高 2h，上 AND 下 XOR。
+    三者都拿不到形状 → 返回 None，调用方会放弃压暗这只光标。
+    宁可不动，也绝不生成一个不透明的黑方块顶上（这是之前 I 形光标的坑）。
+    """
+    ii = ICONINFO()
+    if not user32.GetIconInfo(hcursor, byref(ii)):
+        return None
+    try:
+        bmm = _BITMAP()
+        gdi32.GetObjectW(ii.hbmMask, ctypes.sizeof(bmm), byref(bmm))
+        if ii.hbmColor:
+            bmc = _BITMAP()
+            if not gdi32.GetObjectW(ii.hbmColor, ctypes.sizeof(bmc),
+                                    byref(bmc)):
+                return None
+            w, h = bmc.bmWidth, bmc.bmHeight
+            if w <= 0 or h <= 0:
+                return None
+            pixels = _read_dib_32(ii.hbmColor, w, h)
+            if pixels is None:
+                return None
+            n = w * h
+            if any(pixels[i] < 255 for i in range(3, n * 4, 4)):
+                transparent = bytes(1 if pixels[i * 4 + 3] == 0 else 0
+                                    for i in range(n))
+                return (pixels, w, h, ii.xHotspot, ii.yHotspot, transparent)
+            bits = _mask_bits(_blit_32(ii.hbmMask, w, h), w, h)
+            if bits and 0 in bits:       # 掩码里得有不透明位才算有用
+                return (pixels, w, h, ii.xHotspot, ii.yHotspot, bits)
+            return None
+        # 单色光标：hbmColor 为 NULL，掩码高 2h（上半 AND，下半 XOR）
+        w, h = bmm.bmWidth, bmm.bmHeight // 2
+        if w <= 0 or h <= 0:
+            return None
+        full = _mask_bits(_blit_32(ii.hbmMask, w, h * 2), w, h * 2)
+        if full is None:
+            return None
+        n = w * h
+        and_bits, xor_bits = full[:n], full[n:]
+        if and_bits.count(0) == 0:       # 全透明 = 数据不可信
+            return None
+        pixels = bytearray(n * 4)
+        for i in range(n):
+            v = 255 if xor_bits[i] else 0     # XOR：1=白 0=黑
+            pixels[i * 4:i * 4 + 4] = bytes((v, v, v, 255))
+        return (bytes(pixels), w, h, ii.xHotspot, ii.yHotspot, and_bits)
+    finally:
+        if ii.hbmMask:
+            gdi32.DeleteObject(ii.hbmMask)
+        if ii.hbmColor:
+            gdi32.DeleteObject(ii.hbmColor)
+
+
+def _build_and_mask(bgra, w, h):
+    """按 alpha 生成 1bpp AND 掩码（1 = 透明），与新位图的透明度保持一致"""
+    stride = ((w + 31) // 32) * 4
+    buf = (ctypes.c_ubyte * (stride * h))()
+    for y in range(h):
+        row_off = (h - 1 - y) * stride         # DDB 自底向上
+        for x in range(w):
+            if bgra[(y * w + x) * 4 + 3] == 0:
+                buf[row_off + (x >> 3)] |= 0x80 >> (x & 7)
+    return gdi32.CreateBitmap(w, h, 1, 1, byref(buf))
 
 
 def _make_dimmed_cursor(base_hcursor, factor):
     """从基准光标生成亮度 factor(0-1) 的压暗副本 HCURSOR；需调用方负责 SetSystemCursor"""
-    got = _read_cursor_bgra(base_hcursor)
+    got = _read_cursor(base_hcursor)
     if got is None:
         return None
-    data, w, h, xh, yh, mask_orig, color_orig = got
+    data, w, h, xh, yh, transparent = got
     n = w * h
     out = bytearray(data)
-    # 无 alpha 通道的老式光标：视为不透明（形状由 AND 掩码决定）
-    has_alpha = any(out[i + 3] for i in range(0, n * 4, 4))
     for i in range(n):
         o = i * 4
-        out[o] = int(out[o] * factor)        # B
-        out[o + 1] = int(out[o + 1] * factor)  # G
-        out[o + 2] = int(out[o + 2] * factor)  # R
-        if not has_alpha:
-            out[o + 3] = 0xFF
+        if transparent[i]:
+            out[o:o + 4] = b"\x00\x00\x00\x00"
+        else:
+            out[o] = int(out[o] * factor)          # B
+            out[o + 1] = int(out[o + 1] * factor)  # G
+            out[o + 2] = int(out[o + 2] * factor)  # R
+            if not out[o + 3]:
+                out[o + 3] = 0xFF   # 老式光标 alpha 无效时补满，形状交给掩码
     # 生成新的 32bpp color 位图（自顶向下 DIB Section）
     bmi = _BMI()
     bmi.bmiHeader.biSize = ctypes.sizeof(_BMIH)
@@ -459,29 +586,86 @@ def _make_dimmed_cursor(base_hcursor, factor):
                                  byref(bits), None, 0)
     gdi32.DeleteDC(hdc)
     if not hbm or not bits:
-        if hbm: gdi32.DeleteObject(hbm)
-        gdi32.DeleteObject(mask_orig); gdi32.DeleteObject(color_orig)
+        if hbm:
+            gdi32.DeleteObject(hbm)
         return None
     ctypes.memmove(bits, bytes(out), n * 4)
-    mask_copy = user32.CopyImage(mask_orig, IMAGE_BITMAP, 0, 0, 0)
+    # 掩码也重建，保证「掩码 + alpha」两套透明度语义完全一致
+    mask = _build_and_mask(out, w, h)
+    if not mask:
+        gdi32.DeleteObject(hbm)
+        return None
     ci = ICONINFO(fIcon=0, xHotspot=xh, yHotspot=yh,
-                  hbmMask=mask_copy, hbmColor=hbm)
+                  hbmMask=mask, hbmColor=hbm)
     hcur = user32.CreateIconIndirect(byref(ci))
     gdi32.DeleteObject(hbm)
-    if mask_copy: gdi32.DeleteObject(mask_copy)
-    gdi32.DeleteObject(mask_orig)
-    gdi32.DeleteObject(color_orig)
+    gdi32.DeleteObject(mask)
     return hcur
 
 
+# 注册表「鼠标方案」里的值名 / 系统默认方案对应的光标文件
+_SCHEME_NAMES = {32512: "Arrow", 32513: "IBeam", 32514: "Wait",
+                 32515: "SizeAll", 32516: "SizeNS", 32642: "SizeNWSE",
+                 32643: "SizeNESW", 32644: "SizeWE", 32645: "SizeNS",
+                 32646: "SizeAll", 32648: "No", 32649: "Hand", 32650: "Pin"}
+_DEFAULT_FILES = {32512: "aero_arrow.cur", 32513: "beam_r.cur",
+                  32514: "aero_busy.ani", 32515: "aero_move.cur",
+                  32516: "aero_ns.cur", 32642: "aero_nwse.cur",
+                  32643: "aero_nesw.cur", 32644: "aero_ew.cur",
+                  32645: "aero_ns.cur", 32646: "aero_move.cur",
+                  32648: "aero_unavail.cur", 32649: "aero_link.cur",
+                  32650: "aero_pin.cur"}
+
+
+def _load_cursor_file(cid):
+    """从当前鼠标方案的 .cur 文件加载（LoadCursorW 拿到的位图被 GDI 转换过、
+    丢了形状信息时的兜底）。动画光标（.ani）跳过 —— 压暗静态化会丢动画。"""
+    cands = []
+    name = _SCHEME_NAMES.get(cid)
+    if name:
+        try:
+            import winreg
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                                r"Control Panel\Cursors") as k:
+                path = winreg.QueryValueEx(k, name)[0]
+            if path:
+                cands.append(path)
+        except OSError:
+            pass
+    fname = _DEFAULT_FILES.get(cid)
+    if fname:
+        cands.append(os.path.join(
+            os.environ.get("SystemRoot", r"C:\Windows"), "cursors", fname))
+    cx = user32.GetSystemMetrics(SM_CXCURSOR) or 32
+    cy = user32.GetSystemMetrics(SM_CYCURSOR) or 32
+    for p in cands:
+        p = os.path.expandvars(p)
+        if not p.lower().endswith(".cur") or not os.path.exists(p):
+            continue
+        h = user32.LoadImageW(None, p, IMAGE_CURSOR, cx, cy, LR_LOADFROMFILE)
+        if h:
+            return h
+    return None
+
+
 def _capture_base_cursors():
+    """抓取每只光标的原始副本；读不出形状的光标直接跳过（不压暗，保持原样）"""
     global _got_base
     if _got_base:
         return
     for cid in CURSOR_IDS:
         h = user32.LoadCursorW(None, cid)
-        if h:
-            _cursor_base[cid] = user32.CopyIcon(h)
+        base = user32.CopyIcon(h) if h else None
+        if base and _read_cursor(base) is not None:
+            _cursor_base[cid] = base
+            continue
+        if base:
+            user32.DestroyCursor(base)
+        alt = _load_cursor_file(cid)
+        if alt:
+            if _read_cursor(alt) is not None:
+                _cursor_base[cid] = user32.CopyIcon(alt)
+            user32.DestroyCursor(alt)
     _got_base = True
 
 
@@ -500,12 +684,12 @@ def cursor_apply(percent):
 
 
 def cursor_restore():
-    """会话内恢复：用开局抓取的基准副本 1:1 重放（保留用户真实光标外观）"""
-    _capture_base_cursors()
-    for cid, base in _cursor_base.items():
-        hcur = _make_dimmed_cursor(base, 1.0)
-        if hcur:
-            user32.SetSystemCursor(hcur, cid)
+    """恢复：直接让系统按当前鼠标方案从注册表重载光标
+
+    不再用「以 factor=1.0 重建光标」的方式回放 —— 重建过程本身就会把
+    依靠掩码定形的光标（I 形文本光标等）弄坏，重载才是 1:1 原样。
+    """
+    cursor_restore_system()
 
 
 def cursor_restore_system():
